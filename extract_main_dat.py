@@ -9,6 +9,7 @@ import math
 import struct
 import zlib
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -17,8 +18,9 @@ DEFAULT_INPUT = Path("SAVE/PROMANAG/036-0/main.dat")
 DEFAULT_OUTPUT = Path("editor/main_dat_extract/current_players_simple.csv")
 DEFAULT_STATIC_DB = Path("DBDAT/jug99036.fdi")
 DEFAULT_TEAM_DB = Path("DBDAT/eq99036.fdi")
-DEFAULT_SEASON_YEAR = 1999
-SAVE_CURRENT_DATE_OFFSETS = (0x32, 0x3A)
+EARLIEST_GAME_YEAR = 1999
+SAVE_CURRENT_DATE_HEADER_BYTES = 0x100
+MAX_SEASON_WEEK = 53
 DISPLAY_MONEY_MULTIPLIER = 10
 MISSING_BIRTHDATE_HASH_SALT = "pc-calcio-7-missing-birthdate-v1"
 
@@ -489,28 +491,40 @@ def valid_date_parts(day: int, month: int, year: int) -> bool:
 
 
 def save_current_date(data: bytes) -> GameDate | None:
-    for offset in SAVE_CURRENT_DATE_OFFSETS:
-        if offset + 5 > len(data):
-            continue
+    candidates: set[GameDate] = set()
+    search_end = min(len(data) - 4, SAVE_CURRENT_DATE_HEADER_BYTES)
+    for offset in range(max(0, search_end)):
+        season_week = data[offset]
         day = data[offset + 1]
         month = data[offset + 2]
         year = little_u16(data[offset + 3 : offset + 5])
-        if valid_date_parts(day, month, year):
-            return GameDate(day=day, month=month, year=year)
-    return None
+        if season_week > MAX_SEASON_WEEK or year < EARLIEST_GAME_YEAR or not valid_date_parts(day, month, year):
+            continue
+        try:
+            date(year, month, day)
+        except ValueError:
+            continue
+        candidates.add(GameDate(day=day, month=month, year=year))
+
+    current_date = next(iter(candidates)) if len(candidates) == 1 else None
+
+    if current_date is not None:
+        print(f"Extracted current date: {current_date.day}/{current_date.month}/{current_date.year}")
+
+    return current_date
 
 
 def player_age(
     birth_day: int,
     birth_month: int,
     birth_year: int,
-    season_year: int,
+    current_year: int,
     reference_date: GameDate | None,
 ) -> int | str:
     if not valid_date_parts(birth_day, birth_month, birth_year):
         return ""
     if reference_date is None:
-        return season_year - birth_year if birth_year <= season_year else ""
+        return current_year - birth_year if birth_year <= current_year else ""
 
     age = reference_date.year - birth_year
     if (reference_date.month, reference_date.day) < (birth_month, birth_day):
@@ -532,10 +546,10 @@ def missing_birthdate_age(
     display_name: str,
     birth_day: int,
     birth_month: int,
-    season_year: int,
+    current_year: int,
     reference_date: GameDate | None,
 ) -> int | str:
-    reference_year = reference_date.year if reference_date is not None else season_year
+    reference_year = reference_date.year if reference_date is not None else current_year
     day = birth_day if 1 <= birth_day <= 31 else (reference_date.day if reference_date is not None else 1)
     month = birth_month if 1 <= birth_month <= 12 else (reference_date.month if reference_date is not None else 1)
 
@@ -543,7 +557,7 @@ def missing_birthdate_age(
     # The real rand() draw is time-seeded at runtime and is not stored in the save,
     # so the extractor uses a stable per-player draw in the same 0..4 range.
     birth_year = reference_year - 25 - missing_birthdate_draw(record_id, display_name)
-    return player_age(day, month, birth_year, season_year, reference_date)
+    return player_age(day, month, birth_year, current_year, reference_date)
 
 
 def decode_pc_calcio_text(data: bytes) -> str:
@@ -617,7 +631,7 @@ def static_stat_pack(record: bytes) -> list[int] | None:
 def static_player(
     record_id: int,
     record: bytes,
-    season_year: int,
+    current_year: int,
     reference_date: GameDate | None = None,
 ) -> StaticPlayer:
     names = player_name_fields(record)
@@ -637,9 +651,9 @@ def static_player(
         nationality = NATIONALITY_NAMES.get(nationality_code, f"code_{nationality_code:02x}")
         display_name = str(names["display_name"] or names["joined_name"] or names["surname"])
         if game_missing_birthdate_year(birth_year):
-            age = missing_birthdate_age(record_id, display_name, birth_day, birth_month, season_year, reference_date)
+            age = missing_birthdate_age(record_id, display_name, birth_day, birth_month, current_year, reference_date)
         else:
-            age = player_age(birth_day, birth_month, birth_year, season_year, reference_date)
+            age = player_age(birth_day, birth_month, birth_year, current_year, reference_date)
 
     return StaticPlayer(
         player_id=record_id,
@@ -656,11 +670,11 @@ def static_player(
 
 def load_static_players(
     path: Path,
-    season_year: int,
+    current_year: int,
     reference_date: GameDate | None = None,
 ) -> dict[int, StaticPlayer]:
     return {
-        record_id: static_player(record_id, record, season_year, reference_date)
+        record_id: static_player(record_id, record, current_year, reference_date)
         for record_id, record in load_dmfi_records(path).items()
     }
 
@@ -1224,7 +1238,7 @@ def live_player_rows(
     data: bytes,
     players: dict[int, StaticPlayer],
     teams: dict[int, TeamInfo],
-    season_year: int,
+    current_year: int,
     reference_date: GameDate | None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -1238,7 +1252,7 @@ def live_player_rows(
         row: dict[str, Any] = {
             "player_id": record.live_player_id,
             "name": record.full_name,
-            "age": player_age(record.birth_day, record.birth_month, record.birth_year, season_year, reference_date),
+            "age": player_age(record.birth_day, record.birth_month, record.birth_year, current_year, reference_date),
             "role": source_player.role if source_player is not None else "",
             "current_me": current_me,
             "nationality": source_player.nationality if source_player is not None else "",
@@ -1264,7 +1278,7 @@ def current_player_rows(
     data: bytes,
     players: dict[int, StaticPlayer],
     teams: dict[int, TeamInfo],
-    season_year: int,
+    current_year: int,
     reference_date: GameDate | None,
 ) -> list[dict[str, Any]]:
     best_by_player_id: dict[int, dict[str, Any]] = {}
@@ -1305,7 +1319,7 @@ def current_player_rows(
         elif expected_stats and stats[:10] == expected_stats:
             best_by_player_id[player.player_id] = row
 
-    for row in live_player_rows(data, players, teams, season_year, reference_date):
+    for row in live_player_rows(data, players, teams, current_year, reference_date):
         best_by_player_id[int(row["player_id"])] = row
 
     return [best_by_player_id[player_id] for player_id in sorted(best_by_player_id)]
@@ -1315,16 +1329,21 @@ def extract_current_players(
     input_path: Path = DEFAULT_INPUT,
     static_db: Path = DEFAULT_STATIC_DB,
     team_db: Path = DEFAULT_TEAM_DB,
-    season_year: int | None = None,
+    current_year: int | None = None,
 ) -> list[dict[str, Any]]:
     data = input_path.read_bytes()
-    reference_date = None if season_year is not None else save_current_date(data)
-    effective_season_year = season_year or (reference_date.year if reference_date else DEFAULT_SEASON_YEAR)
-    players = load_static_players(static_db, effective_season_year, reference_date)
+    reference_date = None if current_year is not None else save_current_date(data)
+    if current_year is None and reference_date is None:
+        raise ValueError(
+            "Could not uniquely decode the current in-game date from the main.dat header; "
+            "use --current-year only as an explicit fallback."
+        )
+    effective_current_year = current_year if current_year is not None else reference_date.year
+    players = load_static_players(static_db, effective_current_year, reference_date)
     league_by_id = dict(TEAM_LEAGUE_BY_ID)
     league_by_id.update(league_membership_from_save(data))
     teams = load_teams(team_db, league_by_id)
-    return current_player_rows(data, players, teams, effective_season_year, reference_date)
+    return current_player_rows(data, players, teams, effective_current_year, reference_date)
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -1362,10 +1381,10 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--static-db", type=Path, default=DEFAULT_STATIC_DB)
     parser.add_argument("--team-db", type=Path, default=DEFAULT_TEAM_DB)
-    parser.add_argument("--season-year", type=int, default=None)
+    parser.add_argument("--current-year", type=int, default=None)
     args = parser.parse_args()
 
-    rows = extract_current_players(args.input, args.static_db, args.team_db, args.season_year)
+    rows = extract_current_players(args.input, args.static_db, args.team_db, args.current_year)
     write_csv(args.output, rows)
     print(f"Wrote {len(rows)} players to {args.output}")
 
