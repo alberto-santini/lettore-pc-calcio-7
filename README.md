@@ -17,3 +17,15 @@ Io lo uso in questo modo:
 * Ho una copia di `CALCIO7` sulla mia scrivania (`/Users/alberto/Desktop`).
 * Dentro la mia copia di `CALCIO7` ho una cartella chiamata `editor`.
 * Il codice è dentro questa cartella `editor`.
+
+## Strumento facoltativo per il cambio di stagione
+
+Lo script `patch_promanag_rollover.py` corregge il blocco che può verificarsi in ProManager dopo aver premuto **Continua** nella schermata **Fine della stagione**.
+Il blocco si materializza soprattutto quando, per un errore, ci sono squadre duplicate che si qualificano per le coppe europee e la tua squadra ne viene cosí estromessa.
+A volte le squadre classificate per la Coppa dei Campioni e la Coppa UEFA contengono errori.
+Per esempio, le qualificate per la Coppa dei Campioni potrebbero essere "Inter, Milan, Milan, Roma", con il Milan ripetuto due volte.
+Questo causa errori nella lista di squadre che si classificano per le coppe europee e la tua squadra potrebbe essere considerata come non classificata.
+Se questo era il tuo obiettivo, viene considerato come non raggiunto, ma solo alla fine della stagione.
+Quindi non vieni mai esonerato durante la stagione, ma il gioco ti esonera "virtualmente" all'ultimissimo turno della stagione in corso.
+Nonappena inizia la stagione seguente del ProManager, quando dovresti scegliere tra le offerte delle squadra, il gioco va in blocco.
+Con questa patch a `MANAGCAL.EXE`, il problema viene risolto.
