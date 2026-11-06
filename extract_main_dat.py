@@ -11,7 +11,7 @@ import zlib
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 
 DEFAULT_INPUT = Path("SAVE/PROMANAG/036-0/main.dat")
@@ -19,8 +19,8 @@ DEFAULT_OUTPUT = Path("editor/main_dat_extract/current_players_simple.csv")
 DEFAULT_STATIC_DB = Path("DBDAT/jug99036.fdi")
 DEFAULT_TEAM_DB = Path("DBDAT/eq99036.fdi")
 EARLIEST_GAME_YEAR = 1999
-SAVE_CURRENT_DATE_HEADER_BYTES = 0x100
-MAX_SEASON_WEEK = 53
+SAVE_HEADER = struct.pack("<II", 0x24, 0x22)
+NO_PRO_CONTRACT_TEAM_ID = 9950
 DISPLAY_MONEY_MULTIPLIER = 10
 MISSING_BIRTHDATE_HASH_SALT = "pc-calcio-7-missing-birthdate-v1"
 
@@ -405,7 +405,6 @@ class GameDate:
 
 @dataclass(frozen=True)
 class StaticPlayer:
-    player_id: int
     name: str
     display_name: str
     surname: str
@@ -413,7 +412,6 @@ class StaticPlayer:
     role: str
     nationality: str
     nationality_code: int | str
-    base_stats: list[int] | None
 
 
 @dataclass(frozen=True)
@@ -425,53 +423,11 @@ class TeamInfo:
 
 
 @dataclass(frozen=True)
-class StatRow:
-    offset: int
-    context_id: int
-    next_player_id: int
-    stat_pack: list[int]
-    extra_pack: list[int]
-    position_pack: list[int]
-
-    @property
-    def offset_hex(self) -> str:
-        return f"0x{self.offset:x}"
-
-
-@dataclass(frozen=True)
-class LivePlayerRecord:
-    offset: int
-    context_id: int
-    source_player_id: int
-    live_player_id: int
-    full_name: str
-    birth_day: int
-    birth_month: int
-    birth_year: int
-    current_me: int | str
+class SavedContract:
     team_id: int
-    current_yearly_salary: int
-    contract_years_left: int | str
-    contract_years_total: int | str
-    contract_current_years_left: int | str
-    contract_renewal_years: int | str
-    contract_renewal_yearly_salary: int | str
-
-    @property
-    def offset_hex(self) -> str:
-        return f"0x{self.offset:x}"
-
-
-@dataclass(frozen=True)
-class ContractCandidate:
-    offset: int
-    team_id: int
-    team: TeamInfo
-    market_value: float
     yearly_salary: float
     years_left: int | str
     years_total: int | str
-    legacy_years_hint: int | str
 
 
 def little_u16(data: bytes) -> int:
@@ -482,36 +438,41 @@ def little_u32(data: bytes) -> int:
     return int.from_bytes(data, "little")
 
 
-def little_f32(data: bytes) -> float:
-    return struct.unpack("<f", data)[0]
-
-
 def valid_date_parts(day: int, month: int, year: int) -> bool:
     return 1 <= day <= 31 and 1 <= month <= 12 and 1800 <= year <= 2100
 
 
-def save_current_date(data: bytes) -> GameDate | None:
-    candidates: set[GameDate] = set()
-    search_end = min(len(data) - 4, SAVE_CURRENT_DATE_HEADER_BYTES)
-    for offset in range(max(0, search_end)):
-        season_week = data[offset]
-        day = data[offset + 1]
-        month = data[offset + 2]
-        year = little_u16(data[offset + 3 : offset + 5])
-        if season_week > MAX_SEASON_WEEK or year < EARLIEST_GAME_YEAR or not valid_date_parts(day, month, year):
-            continue
-        try:
-            date(year, month, day)
-        except ValueError:
-            continue
-        candidates.add(GameDate(day=day, month=month, year=year))
+def saved_player_table_offset(data: bytes) -> int:
+    if not data.startswith(SAVE_HEADER):
+        raise ValueError("Unsupported main.dat header. Expected the PC Calcio 7 0x24/0x22 save format.")
 
-    current_date = next(iter(candidates)) if len(candidates) == 1 else None
+    cursor = len(SAVE_HEADER)
+    try:
+        for _ in range(2):
+            length = struct.unpack_from("<H", data, cursor)[0]
+            cursor += 2 + length
+    except struct.error as error:
+        raise ValueError("Truncated main.dat header.") from error
 
-    if current_date is not None:
-        print(f"Extracted current date: {current_date.day}/{current_date.month}/{current_date.year}")
+    # Host date, game settings, manager club, week, game date, and next player ID.
+    table_offset = cursor + 4 + 18 + 2 + 1 + 4 + 4
+    if table_offset + 2 > len(data):
+        raise ValueError("Truncated main.dat header or player table.")
+    return table_offset
 
-    return current_date
+
+def save_current_date(data: bytes, table_offset: int) -> GameDate | None:
+    # The game date is immediately before the four-byte next-player counter.
+    day, month, year = struct.unpack_from("<BBH", data, table_offset - 8)
+    if year < EARLIEST_GAME_YEAR or not valid_date_parts(day, month, year):
+        return None
+    try:
+        date(year, month, day)
+    except ValueError:
+        return None
+
+    print(f"Extracted current date: {day}/{month}/{year}")
+    return GameDate(day=day, month=month, year=year)
 
 
 def player_age(
@@ -621,13 +582,6 @@ def player_name_fields(record: bytes) -> dict[str, Any]:
     }
 
 
-def static_stat_pack(record: bytes) -> list[int] | None:
-    if len(record) < 16:
-        return None
-    pack = list(record[-16:])
-    return pack if all(value <= 99 for value in pack) else None
-
-
 def static_player(
     record_id: int,
     record: bytes,
@@ -656,7 +610,6 @@ def static_player(
             age = player_age(birth_day, birth_month, birth_year, current_year, reference_date)
 
     return StaticPlayer(
-        player_id=record_id,
         name=str(names["joined_name"]),
         display_name=str(names["display_name"]),
         surname=str(names["surname"]),
@@ -664,7 +617,6 @@ def static_player(
         role=role,
         nationality=nationality,
         nationality_code=nationality_code,
-        base_stats=static_stat_pack(record),
     )
 
 
@@ -805,605 +757,153 @@ def load_teams(path: Path, league_by_id: dict[int, str] | None = None) -> dict[i
     }
 
 
-def find_stat_rows(data: bytes) -> list[StatRow]:
-    rows: list[StatRow] = []
-    for offset in range(0, len(data) - 48):
-        if data[offset : offset + 2] != data[offset + 2 : offset + 4]:
-            continue
-        if data[offset + 4] != 0:
-            continue
-        if data[offset + 21 : offset + 23] != data[offset + 23 : offset + 25]:
-            continue
-
-        stat_pack = list(data[offset + 5 : offset + 21])
-        extra_pack = list(data[offset + 25 : offset + 30])
-        position_pack = list(data[offset + 30 : offset + 34])
-        if not all(value <= 99 for value in stat_pack):
-            continue
-        if not all(value <= 99 for value in extra_pack):
-            continue
-        if max(stat_pack[:10]) < 20:
-            continue
-
-        rows.append(
-            StatRow(
-                offset=offset,
-                context_id=little_u16(data[offset : offset + 2]),
-                next_player_id=little_u16(data[offset + 21 : offset + 23]),
-                stat_pack=stat_pack,
-                extra_pack=extra_pack,
-                position_pack=position_pack,
-            )
-        )
-    return rows
-
-
-def looks_like_player_row(
-    data: bytes,
-    offset: int,
-    players: dict[int, StaticPlayer],
-    teams: dict[int, TeamInfo],
-) -> StatRow | None:
-    if offset + 48 > len(data):
-        return None
-    if data[offset + 4] != 0:
-        return None
-    if data[offset + 21 : offset + 23] != data[offset + 23 : offset + 25]:
-        return None
-
-    first_team_id = little_u16(data[offset : offset + 2])
-    second_team_id = little_u16(data[offset + 2 : offset + 4])
-    next_player_id = little_u16(data[offset + 21 : offset + 23])
-    if first_team_id not in teams or second_team_id not in teams:
-        return None
-    if next_player_id not in players:
-        return None
-
-    stat_pack = list(data[offset + 5 : offset + 21])
-    extra_pack = list(data[offset + 25 : offset + 30])
-    position_pack = list(data[offset + 30 : offset + 34])
-    if not all(value <= 99 for value in stat_pack):
-        return None
-    if not all(value <= 99 for value in extra_pack):
-        return None
-    if max(stat_pack[:10]) < 20:
-        return None
-    if stat_pack[:10].count(0) >= 3:
-        return None
-
-    return StatRow(
-        offset=offset,
-        context_id=first_team_id,
-        next_player_id=next_player_id,
-        stat_pack=stat_pack,
-        extra_pack=extra_pack,
-        position_pack=position_pack,
-    )
-
-
-def find_player_rows(data: bytes, players: dict[int, StaticPlayer], teams: dict[int, TeamInfo]) -> list[StatRow]:
-    rows: list[StatRow] = []
-    for offset in range(0, len(data) - 48):
-        row = looks_like_player_row(data, offset, players, teams)
-        if row is not None:
-            rows.append(row)
-    return rows
-
-
-def static_stats_in_save_order(base_stats: list[int]) -> list[int]:
-    return [
-        base_stats[0],
-        base_stats[1],
-        base_stats[2],
-        base_stats[3],
-        base_stats[5],
-        base_stats[4],
-        base_stats[6],
-        base_stats[7],
-        base_stats[8],
-        base_stats[9],
-    ]
-
-
-def row_header_bytes(row: StatRow) -> list[int]:
-    return list(row.context_id.to_bytes(2, "little") * 2 + b"\x00")
-
-
-def embeds_following_header(row: StatRow, next_row: StatRow | None) -> bool:
-    return next_row is not None and next_row.offset == row.offset + 5 and row.stat_pack[:5] == row_header_bytes(next_row)
-
-
-def displayed_me(stats: Sequence[int]) -> int:
+def displayed_me(stats: bytes) -> int:
     return sum(stats[:4]) // 4
 
 
-def score_stat_candidate(
-    candidate: StatRow,
-    next_candidate: StatRow | None,
-    expected_stats: list[int],
-    distance: int,
-) -> tuple[int, str]:
-    if expected_stats and candidate.stat_pack[:10] == expected_stats:
-        return 1000 - distance, "base_match"
-    if embeds_following_header(candidate, next_candidate):
-        return -1000 - distance, "embedded_header"
-
-    current_me = displayed_me(candidate.stat_pack)
-    score = -distance
-    if current_me >= 20:
-        score += 50
-    if candidate.stat_pack[:4].count(0) >= 3:
-        score -= 100
-    if candidate.stat_pack[:5].count(0) >= 4:
-        score -= 100
-    return score, "fallback"
+def display_money(value: float) -> int | str:
+    return int(round(value * DISPLAY_MONEY_MULTIPLIER)) if math.isfinite(value) else ""
 
 
-def choose_current_stat_row(marker_index: int, rows: list[StatRow], expected_stats: list[int]) -> StatRow | None:
-    marker = rows[marker_index]
-    best_row: StatRow | None = None
-    best_score = -10_000
-
-    for candidate_index in range(marker_index + 1, min(len(rows), marker_index + 10)):
-        candidate = rows[candidate_index]
-        if candidate.offset - marker.offset >= 512:
-            break
-        next_candidate = rows[candidate_index + 1] if candidate_index + 1 < len(rows) else None
-        score, _reason = score_stat_candidate(candidate, next_candidate, expected_stats, candidate_index - marker_index)
-        if score > best_score:
-            best_row = candidate
-            best_score = score
-    return best_row
-
-
-def looks_like_money(value: float, maximum: int) -> bool:
-    return (
-        math.isfinite(value)
-        and 1_000 <= value < maximum
-        and abs(value - round(value)) <= max(1.0, abs(value) * 0.000001)
-    )
+def read_saved_contract(data: bytes, offset: int) -> tuple[SavedContract, int]:
+    team_id, _, yearly_salary, clause_value = struct.unpack_from("<Hfff", data, offset)
+    cursor = offset + 14  # Club ID and three floats.
+    if clause_value > 0:
+        cursor += 2
+    if data[cursor]:
+        cursor += 1
+    years_code = data[cursor + 1]
+    years_left: int | str = years_code >> 4
+    years_total: int | str = years_code & 0x0F
+    if team_id >= NO_PRO_CONTRACT_TEAM_ID or years_code == 0xFF:
+        years_left = years_total = 0
+    elif not 0 <= years_left <= years_total <= 9:
+        years_left = years_total = ""
+    return SavedContract(team_id, yearly_salary, years_left, years_total), cursor + 3
 
 
-def display_money(value: float) -> int:
-    return int(round(value * DISPLAY_MONEY_MULTIPLIER))
+def read_player_contracts(data: bytes, offset: int) -> tuple[SavedContract, SavedContract | None, int]:
+    # Variable-length fields read by the player loader in MANAGCAL.EXE at 0x4dd9e0.
+    active, cursor = read_saved_contract(data, offset)
+    for entry_size in (20, 12):
+        cursor += 1 + data[cursor] * entry_size
+
+    tag = struct.unpack_from("<H", data, cursor)[0]
+    cursor += 4 if tag else 2
+    cursor += 1  # Status byte.
+
+    has_second_contract = data[cursor]
+    cursor += 1
+    second_contract = None
+    if has_second_contract:
+        second_contract, cursor = read_saved_contract(data, cursor)
+        cursor += 9  # Extra fields on the second contract.
+
+    for entry_size in (4, 4, 5):
+        cursor += 1 + data[cursor] * entry_size
+
+    stat_offset = cursor + (6 if data[cursor] else 1)  # Flag and optional five-byte entry.
+    return active, second_contract, stat_offset
 
 
-def repeated_nibble_years(byte: int) -> int | None:
-    high = byte >> 4
-    low = byte & 0x0F
-    if high == low and 1 <= high <= 9:
-        return high
-    return None
-
-
-def find_contract_years(data: bytes, start: int, end: int) -> int | str:
-    for offset in range(start, end):
-        years = repeated_nibble_years(data[offset])
-        if years is not None:
-            return years
-    return ""
-
-
-def contract_years_from_code(byte: int) -> tuple[int, int] | None:
-    high = byte >> 4
-    low = byte & 0x0F
-    # High nibble is years remaining; low nibble is the original/total term.
-    if 0 <= high <= low <= 9:
-        return high, low
-    return None
-
-
-def decoded_contract_years(tail: bytes) -> tuple[int | str, int | str]:
-    if len(tail) >= 8 and looks_like_money(little_f32(tail[:4]), 2_000_000_000):
-        years = contract_years_from_code(tail[7])
-        if years is not None:
-            return years
-
-    if len(tail) >= 7 and tail[4] == 0x14:
-        years = contract_years_from_code(tail[6])
-        if years is not None:
-            return years
-
-    if len(tail) >= 6:
-        years = contract_years_from_code(tail[5])
-        if years is not None:
-            return years
-        if tail[5] == 0xFF:
-            return 0, 0
-
-    if len(tail) >= 7:
-        years = contract_years_from_code(tail[6])
-        if years is not None:
-            return years
-
-    return "", ""
-
-
-def contract_candidate_score(candidate: ContractCandidate) -> tuple[int, int]:
-    return (1 if candidate.legacy_years_hint != "" else 0, candidate.offset)
-
-
-def renewal_candidate_for(
-    candidate: ContractCandidate,
-    candidates: Sequence[ContractCandidate],
-) -> ContractCandidate | None:
-    if not isinstance(candidate.years_left, int) or candidate.years_left != 1:
-        return None
-
-    possible_renewals = [
-        renewal
-        for renewal in candidates
-        if renewal.offset > candidate.offset
-        and renewal.team_id == candidate.team_id
-        and 20 <= renewal.offset - candidate.offset <= 32
-        and isinstance(renewal.years_left, int)
-        and renewal.years_left > 0
-    ]
-    if not possible_renewals:
-        return None
-    return min(possible_renewals, key=lambda renewal: renewal.offset)
-
-
-def contract_candidate_fields(
-    candidate: ContractCandidate,
-    renewal: ContractCandidate | None = None,
-) -> dict[str, Any]:
-    years_left = candidate.years_left
+def contract_fields(active: SavedContract, second_contract: SavedContract | None) -> dict[str, Any]:
+    years_left = active.years_left
     renewal_years: int | str = 0 if isinstance(years_left, int) else ""
     renewal_salary: int | str = ""
-
-    if renewal is not None and isinstance(years_left, int) and isinstance(renewal.years_left, int):
-        renewal_years = renewal.years_left
-        renewal_salary = display_money(renewal.yearly_salary)
-        years_left = years_left + renewal.years_left
+    if (
+        second_contract is not None
+        and active.team_id == second_contract.team_id
+        and years_left == 1
+        and isinstance(second_contract.years_left, int)
+        and second_contract.years_left > 0
+    ):
+        renewal_years = second_contract.years_left
+        renewal_salary = display_money(second_contract.yearly_salary)
+        years_left = 1 + renewal_years
 
     return {
-        "team_id": candidate.team_id,
-        "team": candidate.team.name,
-        "team_country": candidate.team.country,
-        "team_league": candidate.team.league,
-        "current_yearly_salary": display_money(candidate.yearly_salary),
+        "current_yearly_salary": display_money(active.yearly_salary),
         "contract_years_left": years_left,
-        "contract_years_total": candidate.years_total,
-        "contract_current_years_left": candidate.years_left,
+        "contract_years_total": active.years_total,
+        "contract_current_years_left": active.years_left,
         "contract_renewal_years": renewal_years,
         "contract_renewal_yearly_salary": renewal_salary,
     }
 
 
-def empty_contract_fields() -> dict[str, Any]:
-    return {
-        "team_id": "",
-        "team": "",
-        "team_country": "",
-        "team_league": "",
-        "current_yearly_salary": "",
-        "contract_years_left": "",
-        "contract_years_total": "",
-        "contract_current_years_left": "",
-        "contract_renewal_years": "",
-        "contract_renewal_yearly_salary": "",
-    }
+def read_saved_player_identity(
+    data: bytes, offset: int, current_year: int, reference_date: GameDate | None
+) -> tuple[str, int | str, int]:
+    cursor = offset + 2  # Allocation size for the two names.
+    short_name_start = cursor + 1
+    cursor = short_name_start + data[cursor]
+    full_name_start = cursor + 1
+    birth_offset = full_name_start + data[cursor]
 
-
-def contract_fields(data: bytes, marker_offset: int, stat_offset: int, teams: dict[int, TeamInfo]) -> dict[str, Any]:
-    candidates: list[ContractCandidate] = []
-    for offset in range(marker_offset + 34, max(marker_offset + 34, stat_offset - 9)):
-        team_id = little_u16(data[offset : offset + 2])
-        if team_id not in teams:
-            continue
-
-        market_value = little_f32(data[offset + 2 : offset + 6])
-        yearly_salary = little_f32(data[offset + 6 : offset + 10])
-        if not looks_like_money(market_value, 10_000_000_000):
-            continue
-        if not looks_like_money(yearly_salary, 2_000_000_000):
-            continue
-
-        contract_tail = data[offset + 10 : stat_offset]
-        legacy_years_hint = find_contract_years(data, offset + 10, stat_offset)
-        years_left, years_total = decoded_contract_years(contract_tail)
-        team = teams[team_id]
-        candidates.append(
-            ContractCandidate(
-                offset=offset,
-                team_id=team_id,
-                team=team,
-                market_value=market_value,
-                yearly_salary=yearly_salary,
-                years_left=years_left,
-                years_total=years_total,
-                legacy_years_hint=legacy_years_hint,
-            )
-        )
-
-    if not candidates:
-        return empty_contract_fields()
-
-    renewal_pairs = [
-        (candidate, renewal)
-        for candidate in candidates
-        if (renewal := renewal_candidate_for(candidate, candidates)) is not None
-    ]
-    if renewal_pairs:
-        candidate, renewal = max(renewal_pairs, key=lambda pair: contract_candidate_score(pair[0]))
-        return contract_candidate_fields(candidate, renewal)
-
-    candidate = max(candidates, key=contract_candidate_score)
-    return contract_candidate_fields(candidate)
-
-
-def saved_contract_end(data: bytes, offset: int) -> int:
-    cursor = offset + 14  # Club ID and three floats.
-    if little_f32(data[offset + 10 : cursor]) > 0:
-        cursor += 2
-    if data[cursor]:
-        cursor += 1
-    return cursor + 3  # Clause tag, packed years, and flags.
-
-
-def saved_stat_header_offset(data: bytes, contract_offset: int) -> int:
-    # Follow the player layout read by MANAGCAL.EXE at 0x4dd9e0.
-    # The player's own ratings are at the end, before the next player ID.
-    cursor = saved_contract_end(data, contract_offset)
-    for entry_size in (20, 12):
-        cursor += 1 + data[cursor] * entry_size
-
-    tag = little_u16(data[cursor : cursor + 2])
-    cursor += 4 if tag else 2
-    cursor += 1  # Status byte.
-
-    has_renewal = data[cursor]
-    cursor += 1
-    if has_renewal:
-        cursor = saved_contract_end(data, cursor) + 9
-
-    for entry_size in (4, 4, 5):
-        cursor += 1 + data[cursor] * entry_size
-
-    return cursor + (6 if data[cursor] else 1)  # Flag and optional five-byte entry.
-
-
-def live_player_me(data: bytes, contract_offset: int) -> int | str:
-    try:
-        cursor = saved_stat_header_offset(data, contract_offset)
-    except (IndexError, struct.error):
-        return ""
-
-    stats = data[cursor + 5 : cursor + 21]  # Skip two club IDs and one status byte.
-    if len(stats) != 16 or max(stats[:4]) > 99:
-        return ""
-    return displayed_me(stats)
-
-
-def player_ratings_from_save(data: bytes) -> dict[int, int]:
-    # The 0x24/0x22 save format places the player table after the dated header.
-    if not data.startswith(struct.pack("<II", 0x24, 0x22)):
-        return {}
-
-    ratings: dict[int, int] = {}
-    cursor = 8
-    try:
-        for _ in range(2):
-            string_length = struct.unpack_from("<H", data, cursor)[0]
-            cursor += 2 + string_length
-        cursor += 29 + 4  # Fixed header fields and the next available player ID.
-
-        while source_id := struct.unpack_from("<H", data, cursor)[0]:
-            player_id = struct.unpack_from("<H", data, cursor + 2)[0]
-            cursor += 4
-            if player_id != source_id:
-                cursor += 2  # Name storage size.
-                for _ in range(2):
-                    cursor += 1 + data[cursor]
-                cursor += 4  # Birth date.
-
-            cursor += 9
-            cursor += 25 if data[cursor] else 1  # Flag and optional 24-byte section.
-            cursor += 2
-            cursor += 5 if data[cursor] else 2  # Flag, optional three bytes, and a status byte.
-            cursor = saved_stat_header_offset(data, cursor)
-            stats = data[cursor + 5 : cursor + 21]
-            if len(stats) != 16 or max(stats) > 99 or player_id == 0 or player_id in ratings:
-                return {}
-            ratings[player_id] = displayed_me(stats)
-            cursor += 21
-    except (IndexError, struct.error):
-        return {}
-    return ratings
-
-
-def parse_live_player_record(data: bytes, offset: int, teams: dict[int, TeamInfo]) -> LivePlayerRecord | None:
-    if offset + 80 > len(data):
-        return None
-
-    context_id = little_u16(data[offset : offset + 2])
-    live_player_id = little_u16(data[offset + 23 : offset + 25])
-    if context_id not in teams:
-        return None
-    if data[offset + 2 : offset + 4] != data[offset : offset + 2]:
-        return None
-    if data[offset + 4] != 0 or data[offset + 26] != 0:
-        return None
-    if live_player_id < 40_000:
-        return None
-
-    # This preceding player's pack helps identify the record boundary.
-    preceding_stats = data[offset + 5 : offset + 21]
-    if max(preceding_stats) > 99:
-        return None
-    if max(preceding_stats[:10]) < 20:
-        return None
-    if preceding_stats[:10].count(0) >= 3:
-        return None
-
-    short_name_len = data[offset + 27]
-    if not 1 <= short_name_len <= 32:
-        return None
-    short_name_start = offset + 28
-    short_name_end = short_name_start + short_name_len
-    if short_name_end >= len(data):
-        return None
-
-    full_name_len = data[short_name_end]
-    if not 1 <= full_name_len <= 80:
-        return None
-    full_name_start = short_name_end + 1
-    full_name_end = full_name_start + full_name_len
-    if full_name_end + 28 > len(data):
-        return None
-
-    short_name = decode_pc_calcio_text(data[short_name_start:short_name_end])
-    full_name = decode_pc_calcio_text(data[full_name_start:full_name_end])
-    if "<" in short_name + full_name:
-        return None
-    if not any(character.isalpha() for character in full_name):
-        return None
-
-    birth_day = data[full_name_end]
-    birth_month = data[full_name_end + 1]
-    birth_year = little_u16(data[full_name_end + 2 : full_name_end + 4])
-    if not valid_date_parts(birth_day, birth_month, birth_year):
-        return None
-
-    technical_pack = list(data[full_name_end + 4 : full_name_end + 14])
-    if not all(value <= 99 for value in technical_pack):
-        return None
-    if data[full_name_end + 14 : full_name_end + 18] != b"\x00\x00\x00\x00":
-        return None
-
-    contract_offset = full_name_end + 18
-    team_id = little_u16(data[contract_offset : contract_offset + 2])
-    if team_id not in teams:
-        return None
-
-    market_value = little_f32(data[contract_offset + 2 : contract_offset + 6])
-    yearly_salary = little_f32(data[contract_offset + 6 : contract_offset + 10])
-    if not looks_like_money(market_value, 10_000_000_000):
-        return None
-    if not looks_like_money(yearly_salary, 2_000_000_000):
-        return None
-
-    years_left, years_total = decoded_contract_years(data[contract_offset + 10 : contract_offset + 25])
-    renewal_years: int | str = 0 if isinstance(years_left, int) else ""
-    return LivePlayerRecord(
-        offset=offset,
-        context_id=context_id,
-        source_player_id=little_u16(data[offset + 21 : offset + 23]),
-        live_player_id=live_player_id,
-        full_name=full_name,
-        birth_day=birth_day,
-        birth_month=birth_month,
-        birth_year=birth_year,
-        current_me=live_player_me(data, contract_offset),
-        team_id=team_id,
-        current_yearly_salary=display_money(yearly_salary),
-        contract_years_left=years_left,
-        contract_years_total=years_total,
-        contract_current_years_left=years_left,
-        contract_renewal_years=renewal_years,
-        contract_renewal_yearly_salary="",
-    )
-
-
-def find_live_player_records(data: bytes, teams: dict[int, TeamInfo]) -> list[LivePlayerRecord]:
-    records: list[LivePlayerRecord] = []
-    for offset in range(0, len(data) - 80):
-        record = parse_live_player_record(data, offset, teams)
-        if record is not None:
-            records.append(record)
-    return records
-
-
-def live_player_rows(
-    data: bytes,
-    players: dict[int, StaticPlayer],
-    teams: dict[int, TeamInfo],
-    current_year: int,
-    reference_date: GameDate | None,
-) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for record in find_live_player_records(data, teams):
-        source_player = players.get(record.source_player_id)
-        team = teams[record.team_id]
-        row: dict[str, Any] = {
-            "player_id": record.live_player_id,
-            "name": record.full_name,
-            "age": player_age(record.birth_day, record.birth_month, record.birth_year, current_year, reference_date),
-            "role": source_player.role if source_player is not None else "",
-            "current_me": record.current_me,
-            "nationality": source_player.nationality if source_player is not None else "",
-            "nationality_code": source_player.nationality_code if source_player is not None else "",
-            "team_id": record.team_id,
-            "team": team.name,
-            "team_country": team.country,
-            "team_league": team.league,
-            "current_yearly_salary": record.current_yearly_salary,
-            "contract_years_left": record.contract_years_left,
-            "contract_years_total": record.contract_years_total,
-            "contract_current_years_left": record.contract_current_years_left,
-            "contract_renewal_years": record.contract_renewal_years,
-            "contract_renewal_yearly_salary": record.contract_renewal_yearly_salary,
-            "save_offset": record.offset_hex,
-            "id_marker_offset": record.offset_hex,
-        }
-        rows.append(row)
-    return rows
+    day, month, year = struct.unpack_from("<BBH", data, birth_offset)
+    name = decode_pc_calcio_text(data[full_name_start:birth_offset])
+    if not name:
+        name = decode_pc_calcio_text(data[short_name_start:cursor])
+    return name, player_age(day, month, year, current_year, reference_date), birth_offset + 4
 
 
 def current_player_rows(
     data: bytes,
+    table_offset: int,
     players: dict[int, StaticPlayer],
     teams: dict[int, TeamInfo],
     current_year: int,
     reference_date: GameDate | None,
 ) -> list[dict[str, Any]]:
-    best_by_player_id: dict[int, dict[str, Any]] = {}
-    rows = sorted(find_player_rows(data, players, teams), key=lambda row: row.offset)
+    rows: dict[int, dict[str, Any]] = {}
+    cursor = table_offset
+    try:
+        while source_id := struct.unpack_from("<H", data, cursor)[0]:
+            marker_offset = cursor
+            player_id = struct.unpack_from("<H", data, cursor + 2)[0]
+            if player_id == 0 or player_id in rows:
+                raise ValueError(f"Invalid or repeated player ID {player_id} at {marker_offset:#x}.")
+            cursor += 4
 
-    for marker_index, marker in enumerate(rows[:-1]):
-        player = players.get(marker.next_player_id)
-        if player is None:
-            continue
+            source_player = players.get(source_id)
+            if player_id != source_id:
+                name, age, cursor = read_saved_player_identity(data, cursor, current_year, reference_date)
+            elif source_player is not None:
+                name = source_player.display_name or source_player.name or source_player.surname
+                age = source_player.age
+            else:
+                name = age = ""
 
-        expected_stats: list[int] = []
-        if player.base_stats is not None and len(player.base_stats) >= 10:
-            expected_stats = static_stats_in_save_order(player.base_stats)
+            cursor += 9  # Technical and position bytes.
+            cursor += 25 if data[cursor] else 1  # Flag and optional 24-byte section.
+            cursor += 2
+            cursor += 5 if data[cursor] else 2  # Injury flag, optional three bytes, and status.
+            active, second_contract, stat_offset = read_player_contracts(data, cursor)
+            # Skip the second club ID and the status byte before the stats.
+            team_id, stats = struct.unpack_from("<H3x16s", data, stat_offset)
+            team = teams.get(team_id)
 
-        # The marker row carries the next player's id/contract; the following row carries their main stats.
-        stat_row = rows[marker_index + 1]
-        if stat_row.offset - marker.offset >= 512:
-            continue
+            rows[player_id] = {
+                "player_id": player_id,
+                "name": name,
+                "age": age,
+                "role": source_player.role if source_player is not None else "",
+                "current_me": displayed_me(stats),
+                "nationality": source_player.nationality if source_player is not None else "",
+                "nationality_code": source_player.nationality_code if source_player is not None else "",
+                "team_id": team_id,
+                "team": team.name if team is not None else "",
+                "team_country": team.country if team is not None else "",
+                "team_league": team.league if team is not None else "",
+                **contract_fields(active, second_contract),
+                "save_offset": f"{stat_offset:#x}",
+                "id_marker_offset": f"{marker_offset:#x}",
+            }
+            cursor = stat_offset + 21
+    except (IndexError, struct.error) as error:
+        raise ValueError(f"Truncated or invalid player table near offset {cursor:#x}.") from error
 
-        stats = stat_row.stat_pack
-        display_name = player.display_name or player.name or player.surname
-        row: dict[str, Any] = {
-            "player_id": player.player_id,
-            "name": display_name,
-            "age": player.age,
-            "role": player.role,
-            "current_me": displayed_me(stats),
-            "nationality": player.nationality,
-            "nationality_code": player.nationality_code,
-            **contract_fields(data, marker.offset, stat_row.offset, teams),
-            "save_offset": stat_row.offset_hex,
-            "id_marker_offset": marker.offset_hex,
-        }
-
-        existing = best_by_player_id.get(player.player_id)
-        if existing is None:
-            best_by_player_id[player.player_id] = row
-        elif expected_stats and stats[:10] == expected_stats:
-            best_by_player_id[player.player_id] = row
-
-    for row in live_player_rows(data, players, teams, current_year, reference_date):
-        best_by_player_id[int(row["player_id"])] = row
-
-    for player_id, rating in player_ratings_from_save(data).items():
-        if player_id in best_by_player_id:
-            best_by_player_id[player_id]["current_me"] = rating
-
-    return [best_by_player_id[player_id] for player_id in sorted(best_by_player_id)]
+    return [rows[player_id] for player_id in sorted(rows)]
 
 
 def extract_current_players(
@@ -1413,10 +913,11 @@ def extract_current_players(
     current_year: int | None = None,
 ) -> list[dict[str, Any]]:
     data = input_path.read_bytes()
-    reference_date = None if current_year is not None else save_current_date(data)
+    table_offset = saved_player_table_offset(data)
+    reference_date = None if current_year is not None else save_current_date(data, table_offset)
     if current_year is None and reference_date is None:
         raise ValueError(
-            "Could not uniquely decode the current in-game date from the main.dat header; "
+            "Could not decode a valid in-game date from the main.dat header; "
             "use --current-year only as an explicit fallback."
         )
     effective_current_year = current_year if current_year is not None else reference_date.year
@@ -1424,7 +925,7 @@ def extract_current_players(
     league_by_id = dict(TEAM_LEAGUE_BY_ID)
     league_by_id.update(league_membership_from_save(data))
     teams = load_teams(team_db, league_by_id)
-    return current_player_rows(data, players, teams, effective_current_year, reference_date)
+    return current_player_rows(data, table_offset, players, teams, effective_current_year, reference_date)
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
