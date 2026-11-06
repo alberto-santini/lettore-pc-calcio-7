@@ -448,7 +448,7 @@ class LivePlayerRecord:
     birth_day: int
     birth_month: int
     birth_year: int
-    stat_pack: list[int]
+    current_me: int | str
     team_id: int
     current_yearly_salary: int
     contract_years_left: int | str
@@ -1133,6 +1133,86 @@ def contract_fields(data: bytes, marker_offset: int, stat_offset: int, teams: di
     return contract_candidate_fields(candidate)
 
 
+def saved_contract_end(data: bytes, offset: int) -> int:
+    cursor = offset + 14  # Club ID and three floats.
+    if little_f32(data[offset + 10 : cursor]) > 0:
+        cursor += 2
+    if data[cursor]:
+        cursor += 1
+    return cursor + 3  # Clause tag, packed years, and flags.
+
+
+def saved_stat_header_offset(data: bytes, contract_offset: int) -> int:
+    # Follow the player layout read by MANAGCAL.EXE at 0x4dd9e0.
+    # The player's own ratings are at the end, before the next player ID.
+    cursor = saved_contract_end(data, contract_offset)
+    for entry_size in (20, 12):
+        cursor += 1 + data[cursor] * entry_size
+
+    tag = little_u16(data[cursor : cursor + 2])
+    cursor += 4 if tag else 2
+    cursor += 1  # Status byte.
+
+    has_renewal = data[cursor]
+    cursor += 1
+    if has_renewal:
+        cursor = saved_contract_end(data, cursor) + 9
+
+    for entry_size in (4, 4, 5):
+        cursor += 1 + data[cursor] * entry_size
+
+    return cursor + (6 if data[cursor] else 1)  # Flag and optional five-byte entry.
+
+
+def live_player_me(data: bytes, contract_offset: int) -> int | str:
+    try:
+        cursor = saved_stat_header_offset(data, contract_offset)
+    except (IndexError, struct.error):
+        return ""
+
+    stats = data[cursor + 5 : cursor + 21]  # Skip two club IDs and one status byte.
+    if len(stats) != 16 or max(stats[:4]) > 99:
+        return ""
+    return displayed_me(stats)
+
+
+def player_ratings_from_save(data: bytes) -> dict[int, int]:
+    # The 0x24/0x22 save format places the player table after the dated header.
+    if not data.startswith(struct.pack("<II", 0x24, 0x22)):
+        return {}
+
+    ratings: dict[int, int] = {}
+    cursor = 8
+    try:
+        for _ in range(2):
+            string_length = struct.unpack_from("<H", data, cursor)[0]
+            cursor += 2 + string_length
+        cursor += 29 + 4  # Fixed header fields and the next available player ID.
+
+        while source_id := struct.unpack_from("<H", data, cursor)[0]:
+            player_id = struct.unpack_from("<H", data, cursor + 2)[0]
+            cursor += 4
+            if player_id != source_id:
+                cursor += 2  # Name storage size.
+                for _ in range(2):
+                    cursor += 1 + data[cursor]
+                cursor += 4  # Birth date.
+
+            cursor += 9
+            cursor += 25 if data[cursor] else 1  # Flag and optional 24-byte section.
+            cursor += 2
+            cursor += 5 if data[cursor] else 2  # Flag, optional three bytes, and a status byte.
+            cursor = saved_stat_header_offset(data, cursor)
+            stats = data[cursor + 5 : cursor + 21]
+            if len(stats) != 16 or max(stats) > 99 or player_id == 0 or player_id in ratings:
+                return {}
+            ratings[player_id] = displayed_me(stats)
+            cursor += 21
+    except (IndexError, struct.error):
+        return {}
+    return ratings
+
+
 def parse_live_player_record(data: bytes, offset: int, teams: dict[int, TeamInfo]) -> LivePlayerRecord | None:
     if offset + 80 > len(data):
         return None
@@ -1148,12 +1228,13 @@ def parse_live_player_record(data: bytes, offset: int, teams: dict[int, TeamInfo
     if live_player_id < 40_000:
         return None
 
-    stat_pack = list(data[offset + 5 : offset + 21])
-    if not all(value <= 99 for value in stat_pack):
+    # This preceding player's pack helps identify the record boundary.
+    preceding_stats = data[offset + 5 : offset + 21]
+    if max(preceding_stats) > 99:
         return None
-    if max(stat_pack[:10]) < 20:
+    if max(preceding_stats[:10]) < 20:
         return None
-    if stat_pack[:10].count(0) >= 3:
+    if preceding_stats[:10].count(0) >= 3:
         return None
 
     short_name_len = data[offset + 27]
@@ -1214,7 +1295,7 @@ def parse_live_player_record(data: bytes, offset: int, teams: dict[int, TeamInfo
         birth_day=birth_day,
         birth_month=birth_month,
         birth_year=birth_year,
-        stat_pack=stat_pack,
+        current_me=live_player_me(data, contract_offset),
         team_id=team_id,
         current_yearly_salary=display_money(yearly_salary),
         contract_years_left=years_left,
@@ -1245,16 +1326,12 @@ def live_player_rows(
     for record in find_live_player_records(data, teams):
         source_player = players.get(record.source_player_id)
         team = teams[record.team_id]
-        if source_player is not None and source_player.base_stats is not None and len(source_player.base_stats) >= 4:
-            current_me = displayed_me(source_player.base_stats)
-        else:
-            current_me = displayed_me(record.stat_pack)
         row: dict[str, Any] = {
             "player_id": record.live_player_id,
             "name": record.full_name,
             "age": player_age(record.birth_day, record.birth_month, record.birth_year, current_year, reference_date),
             "role": source_player.role if source_player is not None else "",
-            "current_me": current_me,
+            "current_me": record.current_me,
             "nationality": source_player.nationality if source_player is not None else "",
             "nationality_code": source_player.nationality_code if source_player is not None else "",
             "team_id": record.team_id,
@@ -1321,6 +1398,10 @@ def current_player_rows(
 
     for row in live_player_rows(data, players, teams, current_year, reference_date):
         best_by_player_id[int(row["player_id"])] = row
+
+    for player_id, rating in player_ratings_from_save(data).items():
+        if player_id in best_by_player_id:
+            best_by_player_id[player_id]["current_me"] = rating
 
     return [best_by_player_id[player_id] for player_id in sorted(best_by_player_id)]
 

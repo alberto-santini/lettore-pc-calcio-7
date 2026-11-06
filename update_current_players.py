@@ -160,13 +160,13 @@ def refresh_current_players(
     static_db: Path,
     team_db: Path,
     output: Path,
-    season_year: int | None,
+    current_year: int | None,
 ) -> tuple[list[str], int]:
     with tempfile.TemporaryDirectory(prefix="calcio7-save-") as temporary_dir:
         extracted_save_dir = extract_save_folder(vm_image, vm_save_dir, Path(temporary_dir))
         copied = copy_save_files(extracted_save_dir, local_save_dir)
 
-    rows = extract_current_players(local_save_dir / "main.dat", static_db, team_db, season_year)
+    rows = extract_current_players(local_save_dir / "main.dat", static_db, team_db, current_year)
     clean_generated_outputs(output)
     write_csv(output, rows)
     return copied, len(rows)
@@ -180,7 +180,7 @@ def main() -> None:
     parser.add_argument("--static-db", type=Path, default=DEFAULT_STATIC_DB)
     parser.add_argument("--team-db", type=Path, default=DEFAULT_TEAM_DB)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--season-year", type=int, default=None)
+    parser.add_argument("--current-year", type=int, default=None)
     args = parser.parse_args()
 
     try:
@@ -191,7 +191,7 @@ def main() -> None:
             static_db=resolve_path(args.static_db),
             team_db=resolve_path(args.team_db),
             output=resolve_path(args.output),
-            season_year=args.season_year,
+            current_year=args.current_year,
         )
     except Exception as error:
         raise SystemExit(str(error)) from error
