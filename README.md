@@ -38,3 +38,8 @@ Con questa patch a `MANAGCAL.EXE`, il problema viene risolto.
 
 A volte, andando su **Decisioni** e poi su **Info Manager**, il programma si blocca perché non riesce a leggere le informazioni su alcune partite storiche.
 La patch evita il blocco e stampa una stringa vuota laddove dovrebbero andare le informazioni relative a partite che si sono "perse" nella storia del manager contenuta nel salvataggio.
+
+### Schermo in bianco e nero
+
+A volte, tornando al menu principale, lo schermo diventa in bianco e nero (o con colori strani).
+La patch aggiorna i colori ogni volta che cambia schermata.
