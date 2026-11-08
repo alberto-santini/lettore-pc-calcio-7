@@ -31,12 +31,28 @@ PALETTE_REFRESH_HELPER = bytes.fromhex(
     " e9 a1 ed 36 00"
 )
 
+QUALIFIER_CALL_OFFSET = 0x157EF8
+QUALIFIER_CALL_PATCH = bytes.fromhex("e8 03 87 2b 00 90 90")  # call 0x810600; nop; nop
+QUALIFIER_HELPER_OFFSET = 0x410600
+QUALIFIER_HELPER = bytes.fromhex(
+    # Store the confirmed runner-up in [esi+0xc0a] as before. Only replace
+    # the qualifying-round entrant if it is the same nonzero club.
+    "66 89 86 0a 0c 00 00 66 85 c0 74 3a 66 3b 86 18 0c 00 00 75 31"
+    # Get the opponent from the runner-up playoff at [esi+0xc40].
+    " 8b 96 40 0c 00 00 85 d2 74 27"
+    " 66 3b 42 36 75 06 66 8b 4a 38 eb 0a 66 3b 42 38 75 15 66 8b 4a 36"
+    # Store the opponent only if it is a different, nonzero club.
+    " 66 85 c9 74 0c 66 39 c1 74 07 66 89 8e 18 0c 00 00 c3"
+)
+
 PATCHES = (
     (ROLLOVER_OFFSET, ROLLOVER_PATCH),
     (INFO_RESULT_CALL_OFFSET, INFO_RESULT_CALL_PATCH),
     (INFO_RESULT_HELPER_OFFSET, INFO_RESULT_HELPER),
     (PALETTE_REFRESH_CALL_OFFSET, PALETTE_REFRESH_CALL_PATCH),
-    (PALETTE_REFRESH_HELPER_OFFSET, PALETTE_REFRESH_HELPER)
+    (PALETTE_REFRESH_HELPER_OFFSET, PALETTE_REFRESH_HELPER),
+    (QUALIFIER_CALL_OFFSET, QUALIFIER_CALL_PATCH),
+    (QUALIFIER_HELPER_OFFSET, QUALIFIER_HELPER)
 )
 
 

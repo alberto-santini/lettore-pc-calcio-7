@@ -43,3 +43,11 @@ La patch evita il blocco e stampa una stringa vuota laddove dovrebbero andare le
 
 A volte, tornando al menu principale, lo schermo diventa in bianco e nero (o con colori strani).
 La patch aggiorna i colori ogni volta che cambia schermata.
+
+### Scuadre duplicate in Champions League
+
+Quando due squadre arrivano a pari punti per il secondo e terzo posto, giocano uno spareggio per decidere chi va direttamente alla fase a gruppi della Champions League e chi deve prima passare da una fase eliminatoria.
+Per error, il gioco riserva un posto nella fase eliminatoria per la terza qualificata prima dello spareggio.
+Poi, se la terza vince lo spareggio, gli riserva anche un posto nella fase a gruppi, saltando il passaggio in cui il posto nella fase eliminatoria (precedentemente assegnato alla terza) deve ora passare alla squadra che ha perso lo spareggio.
+In questo caso, quindi, la squadra qualificata terza e che ha vinto lo spareggio, compare due volte tra le squadre di Champions League: una volta inizia dalla fase a gruppi e un'altra inizia dalla fase eliminatoria.
+Se entrambe le copia arrivano alle semifinali, il gioco si blocca perché fallisce il controllo che si assicura che le quattro semifinaliste sono quattro squadre diverse.
